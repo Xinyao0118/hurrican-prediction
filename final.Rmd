@@ -1,0 +1,213 @@
+---
+title: "final"
+author: "uni:xw2598"
+date: "2019/5/11"
+output: pdf_document
+---
+```{r include=FALSE}
+library(data.table)
+library(tidyverse)
+library(lubridate)
+library(caret)
+library(MCMCpack)
+library(mvtnorm)
+library(Boom)
+library(truncnorm)
+library(LaplacesDemon)
+library(parallel) # one of the core R packages
+library(doParallel)
+library(foreach)
+library(base)
+library(purrr)
+```
+
+#Question1
+```{r}
+#data manipulation
+dt= read.csv("./hurrican356.csv")
+dt$date = substr(x = as.character(dt$time),start = 2,stop = 10)
+dt$day = yday(dt$date)
+dt$hour = substr(x = as.character(dt$time),start = 2,stop = 18) %>%
+  str_c("19",.) %>% as_datetime()
+dt$hours = dt$Latitude
+cur = dt$hour[1]
+for(i in 2:nrow(dt)){
+  if(dt$ID[i] == dt$ID[i-1]){
+    dt$hours[i] <- difftime(dt$hour[i],cur,units = "hours") %>% as.numeric()}
+  else{dt$hours[i]= 0
+  cur = dt$hour[i]}
+}
+dt$hours[1]=0
+data = dplyr::select(dt,ID,year = Season,type = Nature,Latitude,Longitude,wind = Wind.kt,day,hours) %>% dplyr::filter(hours%%6==0)
+cur_lat = data$Latitude[1]
+cur_long = data$Longitude[1]
+cur_wind = data$wind[1]
+data$delta_lat=data$delta_long=data$delta_wind=data$Latitude
+for (i in 2:nrow(data)) {
+  if(dt$ID[i] == dt$ID[i-1]){
+    data$delta_lat[i] = data$Latitude[i]-data$Latitude[i-1]
+    data$delta_long[i] = data$Longitude[i]-data$Longitude[i-1]
+    data$delta_wind[i] = data$wind[i]-data$wind[i-1]
+  }
+  else{   
+    cur_lat = data$Latitude[i]
+    cur_long = data$Longitude[i]
+    cur_wind = data$wind[i]
+    data$delta_lat[i] =0
+    data$delta_long[i] = 0
+    data$delta_wind[i] = 0
+  }
+}
+data$delta_lat[1]=data$delta_long[1]=data$delta_wind[1]=0
+head(data,5)
+```
+
+##(1)Randomly select 80% hurricanes 
+
+```{r}
+data$type <- as.numeric(data$type)
+set.seed(1234)
+training.samples = sample(c(1:356),size = 285,replace = FALSE)
+dat.train = data[as.numeric(data$ID) %in% training.samples, ] 
+`%not_in%` <- purrr::negate(`%in%`)
+dat.test <- data[as.numeric(data$ID) %not_in% training.samples,]
+```
+
+##(2)develop an MCMC algorithm to estiamte the posterior mean of the model parameters.
+
+$$Y_{ij}(t)|Y_{ij}(t-6)\sim N(\mu_{ij}(t-6)+\rho_jY_{ij}(t-6),\Sigma)$$
+$$P(Y_{ij}(t)|Y_{ij}(t-6)) \propto (\frac{1}{\sqrt{|\Sigma|}})^mexp{-\frac{1}{2}((Y_{ij}-\mu_{ij}(t-6)-\rho_jY_{ij}(t-6))\Sigma^{-1}(Y_{ij}-\mu_{ij}(t-6)-\rho_jY_{ij}(t-6)))}$$
+So the likelihood is:
+$$L(Y_{ij}) = P(Y_{ij}(t)|Y_{ij}(t-6))*P(Y_{ij}(t-6)|Y_{ij}(t-12)...)$$
+loglikelihood is:
+$$L(Y_{ij}) \propto \sum K\Sigma^{-1}*K^T $$
+K is a 1*3 matrix
+
+$$K = ((Y_{i1}-\mu_{i1}(t-6)-\rho_jY_{i1}(t-6)\ \ Y_{i2}-\mu_{i2}(t-6)-\rho_jY_{i2}(t-6)\ \  Y_{i3}-\mu_{i3}(t-6)-\rho_jY_{i3}(t-6))$$
+
+The prior function is :
+
+$$\pi(\beta_1,...,\beta_m|Y_1,Y_2,...Y_n)*\pi(\rho_1|Y_1,Y_2,...Y_n)\pi(\rho_2|Y_1,Y_2,...Y_n)\pi(\rho_3|Y_1,Y_2,...Y_n)\pi(\Sigma^{-1})$$
+
+```{r}
+x.train = dplyr::select(dat.train,day,year,type,starts_with("delta"))
+Y.train = dplyr::select(dat.train,Latitude,Longitude,wind)
+beta = matrix(nrow = 7 ,ncol = 3)
+id = distinct(dat.train,ID)
+
+#loglikelihood function
+
+logp = matrix(nrow = nrow(distinct(dat.train,ID)),ncol = 1)
+
+loglike = function(Y,X,rho,cov,beta){
+  for (i in 1:nrow(distinct(dat.train,ID))) {
+      y = Y[which(dat.train$ID == id[i,]),] 
+      x = X[which(dat.train$ID == id[i,]),] 
+      logp[i,]=0
+      for(m in length(Y):2){
+      u = beta[1,]+x[m,1]*beta[2,]+x[m,2]*beta[3,]+x[m,3]*beta[4,]+x[m,4]*beta[5,]+x[m,5]*beta[6,]+x[m,6]*beta[7,]
+      a =as.matrix(y[m,]-u-rho*y[m-1,])
+      logp[i,] = logp[i,] - 1/2*log(det(cov))-1/2*a%*%solve(cov)%*%t(a)
+      }
+  }
+  return(sum(logp[,1],na.rm = TRUE))
+}
+
+#set current value for test
+
+beta = matrix(rep(1,21),nrow = 7,ncol = 3)
+cov=rWishart(3,diag(0.1,3),inverse=TRUE)
+rho = c(0.1,0.2,0.3)
+a = loglike(Y.train,x.train,rho,cov,beta)
+
+#prior function
+logprior = function(beta,rho,cov){
+   return(dWishart(solve(cov),diag(0.1,3),3)*dtruncnorm(rho[1],a=0,b=1,mean=0.5,sd = 1/5)*dtruncnorm(rho[2],a=0,b=1,mean=0.5,sd = 1/5)*dtruncnorm(rho[3],a=0,b=1,mean=0.5,sd = 1/5)*dmvn(as.vector(beta),mu = rep(0,21),diag(1,21)))
+  
+}
+#test
+#a = logprior(beta,rho,cov)
+#posterio function
+logpost = function(X,Y,rho,cov,beta){
+  return(loglike(Y,X,rho,cov,beta)+logprior(beta,rho,cov))
+}
+#test
+#a = logpost(x.train,Y.train,rho,cov,beta)
+```
+
+
+```{r MHstep}
+MHstep = function(pars,avec,Y,X){
+  res = pars
+  npars = length(pars)
+  for (i in 1:npars) {
+    prop = res
+    prop[i] = res[i]+2*avec[i]*(runif(1)-0.5)
+    a = matrix(prop[4:12],ncol=3)
+    b= matrix(prop[13:33],ncol=3)
+    c=matrix(res[4:12],ncol=3)
+    d=matrix(res[13:33],ncol=3)
+    if(log(runif(1))<(logpost(X,Y,prop[1:3],a,b)-logpost(X,Y,res[1:3],c,d)))
+    res[i]=prop[i]
+  }
+  return(res)
+}
+#test
+pars = c(rho,as.vector(cov),as.vector(beta))
+avec = c(rep(0.1,3),rep(1,9),rep(1,21))
+```
+
+
+```{r MCMC}
+nCores <- 4  
+registerDoParallel(nCores) 
+#nrep = 1000
+nrep = 3
+avec = c(rep(0.1,3),rep(1,9),rep(1,21)) 
+mchain = matrix(NA,nrow = nrep, ncol = 33)
+mchain[1,] = c(rho,as.vector(cov),as.vector(beta))
+for(i in 2:nrep){
+  mchain[i,]=MHstep(mchain[i-1,],avec,Y.train,x.train)
+}
+mchain <- foreach(i = 2:nrep, .combine = rbind) %dopar% {
+  mchain[i,]=MHstep(mchain[i-1,],avec,Y.train,x.train)
+}
+```
+
+It took hundreds of year to run out if we choose a mcmc chain with length 10000. 
+So for the following steps, I just set the length of mcmc chain as 3, which may be inaccurate for estimation due to small sample size,but it provides a correct thought about the whole MCMC algorithm.
+
+```{r estimate}
+res = colMeans(mchain,na.rm = TRUE)
+rho_hat = res[1:3]
+cov_hat = matrix(res[4:12],ncol=3)
+beta_hat =matrix(res[13:33],ncol=3)
+print(rho_hat)
+print(cov_hat)
+print(beta_hat)
+```
+
+The estimated posterior mean of parameters(recorded by once set nrep = 4)
+$$\rho_1 = 0.0984\\\rho_2 = 0.23436918 \\\rho_3 = 0.29836776$$
+$\Sigma$=  10.699668 4.556651 3.047737
+           4.668151 7.217416 4.595182
+           3.455998 4.694572 8.920684
+
+$\beta_{ij}$ = [1,] 0.6308118 1.1485184 0.8532505
+               [2,] 0.5516681 1.1815708 1.0000000
+               [3,] 0.7783336 0.5053999 0.8885836
+               [4,] 0.7720843 1.4161843 1.0000000
+               [5,] 0.9741097 1.3487143 0.3051520
+               [6,] 0.8998162 0.4097745 1.9334911
+               [7,] 0.6070781 1.1090746 0.5406332
+
+#apply the model
+```{r}
+x.test = dplyr::select(dat.test,day,year,type,starts_with("delta"))
+y.test = dplyr::select(dat.test,Latitude,Longitude,wind)
+
+
+```
+
+
+

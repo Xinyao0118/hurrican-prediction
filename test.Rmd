@@ -1,0 +1,61 @@
+---
+title: "Untitled"
+author: "uni:xw2598"
+date: "2019/5/13"
+output: html_document
+---
+
+```{r}
+#log likelihood
+loglik=function(Y,tots,phi){
+  return(sum(Y*log(phi*tpts)-phi*tpts))
+}
+
+#log of the prior
+logprior = function(phi,beta,alpha,c=0.01){
+  n=length(phi)
+  return(n*alpha*log(beta)-n*lgamma(alpha)-beta*sum(phi)+(alpha-1)*sum(log(phi))-beta +(c-1)*log(beta))
+}
+
+logpost = function(phi,beta,tpts,Y,alpha,c =0.01){
+  if(min(c(phi,alpha,beta))<=0)return(-Inf)
+  else
+    return(loglik(Y,tpts,phi)+logprior(phi,beta,alpha,c))
+}
+##
+MHstep = function(pars,avec,tpts,Y,alpha,c = 0.01){
+  res = pars
+  npars = length(pars)
+  for(i in 1:npars){
+    prop = res
+    prop[i]=res[i]+2*avec[i]*(runif(1)-0.5)
+    if(log(runif(1))<logpost(prop[1:npars-1],prop[npars],tpts,Y,alpha,c)-logpost(res[1:npars-1],res[npars],tpts,Y,alpha,c))
+      res[i]=prop[i]
+  }
+  return(res)
+}
+
+nrep = 1000
+y=c(5,1,5,14,3,19,1,1,4,22)
+tpts=c(94.320,15.720,62.880,125.760,5.240,31.44,1.048,1.048,2.096,10.480)
+avec = rep(0.5,11)
+mchain = matrix(NA,nrow = nrep,ncol = length(y)+1)
+mchain[1,]=rep(1,11)
+
+for(i in 2:nrep){
+  mchain[i,] = MHstep(mchain[i-1,],avec,tpts,y,1.802)
+}
+
+numuique = function(mat){
+  for(i in 1:ncol(mat))
+    cat(i,"\t",length(unique(mat[,i],"\n")))
+}
+numuique(mchain)
+
+avec = c(rep(0.25,4),0.6,0.5,rep(0.75,5))
+
+for (i in 1:ncol(mchain)) {
+  cat(i,"\t",mean(mchain[500:1000,i],"\n"))
+}
+```
+
